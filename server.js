@@ -2,6 +2,16 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
+const {
+  PENALTY_WORD,
+  MAX_PENALTIES,
+  TURN_SECONDS,
+  buildCountryData,
+  createPlayingState,
+  submitLetter,
+  handleTimeout,
+  countActivePlayers
+} = require('./gameLogic');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,9 +27,6 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
-const PENALTY_WORD = 'GHOSTTEARS';
-const MAX_PENALTIES = PENALTY_WORD.length;
-const TURN_SECONDS = 10;
 
 const countries = [
   'Afghanistan','Albania','Algeria','Andorra','Angola','Antigua and Barbuda','Argentina','Armenia','Australia','Austria',
@@ -42,15 +49,7 @@ const countries = [
   'United Kingdom','United States','Uruguay','Uzbekistan','Vanuatu','Vatican City','Venezuela','Vietnam','Yemen','Zambia','Zimbabwe'
 ];
 
-const sanitize = (value) => value.toLowerCase().replace(/[^a-z]/g, '');
-const countrySet = new Set(countries.map(sanitize));
-const prefixSet = new Set();
-for (const country of countrySet) {
-  for (let i = 1; i <= country.length; i += 1) {
-    prefixSet.add(country.slice(0, i));
-  }
-}
-
+const countryData = buildCountryData(countries);
 const rooms = new Map();
 
 function randomRoomCode() {
@@ -65,59 +64,65 @@ function getRoom(code) {
       hostId: null,
       status: 'lobby',
       players: [],
-      currentString: '',
-      usedCountries: [],
-      activePlayerId: null,
+      game: null,
       winnerId: null,
       message: 'Waiting for players.',
-      turnDeadline: null,
-      pausedRemaining: null,
-      lastPenalty: null,
-      tickHandle: null
+      pausedRemainingMs: null,
+      ticker: null
     });
   }
   return rooms.get(code);
 }
 
-function activePlayers(room) {
-  return room.players.filter((player) => !player.eliminated);
+function currentPlayer(room) {
+  if (!room.game) return null;
+  return room.game.players[room.game.currentPlayerIndex] || null;
 }
 
-function findPlayer(room, socketId) {
-  return room.players.find((player) => player.id === socketId) || null;
+function currentPlayerId(room) {
+  const player = currentPlayer(room);
+  return player && player.isActive ? player.id : null;
 }
 
-function nextActivePlayerId(room, afterId) {
-  const alive = activePlayers(room);
-  if (!alive.length) return null;
-  const order = room.players.filter((player) => !player.eliminated).map((player) => player.id);
-  if (!order.length) return null;
-  const idx = Math.max(0, order.indexOf(afterId));
-  for (let i = 1; i <= order.length; i += 1) {
-    const candidate = order[(idx + i) % order.length];
-    if (room.players.find((player) => player.id === candidate && !player.eliminated)) {
-      return candidate;
-    }
+function getTimerSeconds(room) {
+  if (room.status !== 'playing' || !room.game || !room.game.turnDeadline) return 0;
+  return Math.max(0, Math.ceil((room.game.turnDeadline - Date.now()) / 1000));
+}
+
+function roomPlayersForView(room) {
+  if (room.game) {
+    return room.game.players.map((player) => ({
+      id: player.id,
+      name: player.name,
+      penaltyIndex: player.penaltyIndex,
+      isActive: player.isActive
+    }));
   }
-  return order[0];
+  return room.players.map((player) => ({
+    id: player.id,
+    name: player.name,
+    penaltyIndex: player.penaltyIndex || 0,
+    isActive: player.isActive !== false
+  }));
 }
 
 function visibleState(room) {
-  const now = Date.now();
-  const timer = room.turnDeadline ? Math.max(0, Math.ceil((room.turnDeadline - now) / 1000)) : 0;
   return {
     code: room.code,
     hostId: room.hostId,
     status: room.status,
-    players: room.players,
-    currentString: room.currentString.toUpperCase(),
-    activePlayerId: room.activePlayerId,
+    players: roomPlayersForView(room),
+    initialPlayerCount: room.game ? room.game.initialPlayerCount : room.players.length,
+    currentPlayerIndex: room.game ? room.game.currentPlayerIndex : -1,
+    activePlayerId: currentPlayerId(room),
+    currentPartial: room.game ? room.game.currentPartial.toUpperCase() : '',
     winnerId: room.winnerId,
     message: room.message,
-    timer,
+    timer: getTimerSeconds(room),
+    timerActive: room.status === 'playing' && Boolean(room.game && room.game.currentPartial),
     penaltyWord: PENALTY_WORD,
     maxPenalties: MAX_PENALTIES,
-    lastPenalty: room.lastPenalty
+    lastPenalty: room.game ? room.game.lastPenalty : null
   };
 }
 
@@ -126,163 +131,172 @@ function emitRoom(room) {
 }
 
 function stopTicker(room) {
-  if (room.tickHandle) {
-    clearInterval(room.tickHandle);
-    room.tickHandle = null;
+  if (room.ticker) {
+    clearInterval(room.ticker);
+    room.ticker = null;
   }
 }
 
-function startTicker(room) {
-  if (room.tickHandle) return;
-  room.tickHandle = setInterval(() => {
-    if (room.status !== 'playing') return;
-    if (!room.turnDeadline) return;
-    if (Date.now() >= room.turnDeadline) {
-      applyPenalty(room, room.activePlayerId, 'Timeout!');
+function ensureTicker(room) {
+  if (room.ticker) return;
+  room.ticker = setInterval(() => {
+    if (room.status !== 'playing' || !room.game) return;
+
+    const result = handleTimeout(room.game, Date.now());
+    if (result.type === 'round_end') {
+      applyGameResult(room, result);
       emitRoom(room);
-    } else {
+      return;
+    }
+
+    if (room.game.currentPartial) {
       emitRoom(room);
     }
-  }, 500);
+  }, 250);
 }
 
-function checkForWinner(room) {
-  const alive = activePlayers(room);
-  if (alive.length <= 1) {
+function winnerFromGame(room) {
+  if (!room.game || room.game.winnerIndex == null) return null;
+  return room.game.players[room.game.winnerIndex] || null;
+}
+
+function reasonText(reason) {
+  if (reason === 'timeout') return 'Timeout';
+  if (reason === 'repeat-country') return 'Repeat country';
+  if (reason === 'completion') return 'Country completed';
+  return 'Invalid prefix';
+}
+
+function applyGameResult(room, result) {
+  if (!room.game) return;
+
+  if (result.type === 'continue') {
+    const active = currentPlayer(room);
+    room.message = active ? `${active.name}'s turn.` : 'Next turn.';
+    return;
+  }
+
+  if (result.type !== 'round_end') return;
+
+  const penalized = room.game.players[result.playerIndex];
+  const letter = PENALTY_WORD[Math.max(0, penalized.penaltyIndex - 1)] || '';
+  const base = `${penalized.name} takes ${letter ? `'${letter}'` : 'a penalty'} (${reasonText(result.reason)}).`;
+
+  if (room.game.status === 'ended') {
     room.status = 'ended';
-    room.winnerId = alive[0] ? alive[0].id : null;
-    room.turnDeadline = null;
-    if (room.winnerId) {
-      const winner = room.players.find((p) => p.id === room.winnerId);
-      room.message = `${winner.name} wins!`;
-    } else {
-      room.message = 'Game ended.';
-    }
-    return true;
-  }
-  return false;
-}
-
-function resetRound(room, penalizedId) {
-  room.currentString = '';
-  room.turnDeadline = null;
-  room.pausedRemaining = null;
-  room.activePlayerId = nextActivePlayerId(room, penalizedId || room.activePlayerId);
-}
-
-function applyPenalty(room, playerId, reason) {
-  const player = room.players.find((p) => p.id === playerId);
-  if (!player || player.eliminated || room.status !== 'playing') return;
-  player.penalties += 1;
-  room.lastPenalty = { playerId, at: Date.now(), reason };
-
-  if (player.penalties >= MAX_PENALTIES) {
-    player.eliminated = true;
-    room.message = `${player.name} is eliminated. ${reason}`;
-  } else {
-    room.message = `${player.name} takes '${PENALTY_WORD[player.penalties - 1]}'. ${reason}`;
+    const winner = winnerFromGame(room);
+    room.winnerId = winner ? winner.id : null;
+    room.message = winner ? `${base} ${winner.name} wins.` : `${base} Game over.`;
+    return;
   }
 
-  if (!checkForWinner(room)) {
-    resetRound(room, playerId);
-    if (room.activePlayerId) {
-      const next = room.players.find((p) => p.id === room.activePlayerId);
-      room.message += ` ${next ? `${next.name}'s turn.` : ''}`;
-    }
-  }
+  room.status = 'playing';
+  room.winnerId = null;
+  const next = currentPlayer(room);
+  room.message = `${base} ${next ? `${next.name}'s turn.` : ''}`.trim();
 }
 
 function startGame(room, requesterId) {
   if (room.hostId !== requesterId) return;
-  if (room.players.length < 2) return;
+  if (room.players.length < 2 || room.players.length > 8) return;
+
+  room.game = createPlayingState(room.players, countryData);
   room.status = 'playing';
-  room.currentString = '';
-  room.usedCountries = [];
   room.winnerId = null;
-  room.turnDeadline = null;
-  room.pausedRemaining = null;
-  room.lastPenalty = null;
-  for (const player of room.players) {
-    player.penalties = 0;
-    player.eliminated = false;
-  }
-  room.activePlayerId = room.players[0].id;
-  room.message = `${room.players[0].name}'s turn. Type a letter (A-Z).`;
-  startTicker(room);
+  room.pausedRemainingMs = null;
+  const active = currentPlayer(room);
+  room.message = active ? `${active.name}'s turn. Enter one letter (A-Z).` : 'Game started.';
+  ensureTicker(room);
 }
 
-function handleLetter(room, socketId, letter) {
-  if (room.status !== 'playing') return;
-  if (room.activePlayerId !== socketId) return;
-  if (!/^[a-z]$/i.test(letter)) return;
+function onLetter(room, socketId, letter) {
+  if (room.status !== 'playing' || !room.game) return;
 
-  const candidate = `${room.currentString}${letter.toLowerCase()}`;
+  const active = currentPlayer(room);
+  if (!active || active.id !== socketId) return;
 
-  if (!prefixSet.has(candidate)) {
-    applyPenalty(room, socketId, 'Invalid prefix.');
-    return;
-  }
-
-  if (countrySet.has(candidate)) {
-    if (room.usedCountries.includes(candidate)) {
-      applyPenalty(room, socketId, 'Repeated country.');
-      return;
-    }
-    room.usedCountries.push(candidate);
-    applyPenalty(room, socketId, 'Country completed.');
-    return;
-  }
-
-  room.currentString = candidate;
-  room.turnDeadline = Date.now() + TURN_SECONDS * 1000;
-  room.pausedRemaining = null;
-  const nextId = nextActivePlayerId(room, socketId);
-  room.activePlayerId = nextId;
-  const next = room.players.find((p) => p.id === nextId);
-  room.message = `${next ? next.name : 'Next player'}'s turn.`;
+  const result = submitLetter(room.game, String(letter || '').slice(0, 1), Date.now());
+  applyGameResult(room, result);
 }
 
 function togglePause(room, requesterId) {
-  if (room.hostId !== requesterId) return;
+  if (room.hostId !== requesterId || !room.game) return;
+
   if (room.status === 'playing') {
     room.status = 'paused';
-    room.pausedRemaining = room.turnDeadline ? Math.max(0, Math.ceil((room.turnDeadline - Date.now()) / 1000)) : 0;
-    room.turnDeadline = null;
+    room.pausedRemainingMs = room.game.turnDeadline ? Math.max(0, room.game.turnDeadline - Date.now()) : null;
+    room.game.turnDeadline = null;
     room.message = 'Game paused.';
-  } else if (room.status === 'paused') {
+    return;
+  }
+
+  if (room.status === 'paused') {
     room.status = 'playing';
-    if (room.currentString && room.pausedRemaining > 0) {
-      room.turnDeadline = Date.now() + room.pausedRemaining * 1000;
-    } else {
-      room.turnDeadline = null;
+    if (room.game.currentPartial && room.pausedRemainingMs != null) {
+      room.game.turnDeadline = Date.now() + Math.max(1, room.pausedRemainingMs);
     }
+    room.pausedRemainingMs = null;
     room.message = 'Game resumed.';
   }
+}
+
+function moveToLobby(room) {
+  room.status = 'lobby';
+  room.winnerId = null;
+  room.pausedRemainingMs = null;
+  room.game = null;
+  room.players = room.players.map((player) => ({
+    id: player.id,
+    name: player.name,
+    penaltyIndex: 0,
+    isActive: true
+  }));
+  room.message = 'Lobby reset. Host can start again.';
 }
 
 function removePlayerFromRoom(room, socketId) {
   const idx = room.players.findIndex((player) => player.id === socketId);
   if (idx === -1) return;
 
-  const removed = room.players[idx];
-  room.players.splice(idx, 1);
+  const [removed] = room.players.splice(idx, 1);
 
   if (room.hostId === socketId) {
     room.hostId = room.players[0] ? room.players[0].id : null;
+  }
+
+  if (room.game) {
+    const gameIdx = room.game.players.findIndex((player) => player.id === socketId);
+    if (gameIdx !== -1) {
+      room.game.players.splice(gameIdx, 1);
+      room.game.initialPlayerCount = Math.min(room.game.initialPlayerCount, room.game.players.length);
+
+      if (room.game.players.length) {
+        if (room.game.currentPlayerIndex >= room.game.players.length) {
+          room.game.currentPlayerIndex = 0;
+        }
+        if (!room.game.players[room.game.currentPlayerIndex].isActive) {
+          for (let i = 0; i < room.game.players.length; i += 1) {
+            const probe = (room.game.currentPlayerIndex + i) % room.game.players.length;
+            if (room.game.players[probe].isActive) {
+              room.game.currentPlayerIndex = probe;
+              break;
+            }
+          }
+        }
+      }
+
+      if (countActivePlayers(room.game) <= 1) {
+        room.status = 'ended';
+        const winner = room.game.players.find((player) => player.isActive) || null;
+        room.winnerId = winner ? winner.id : null;
+      }
+    }
   }
 
   if (!room.players.length) {
     stopTicker(room);
     rooms.delete(room.code);
     return;
-  }
-
-  if (room.activePlayerId === socketId) {
-    room.activePlayerId = nextActivePlayerId(room, socketId);
-  }
-
-  if (room.status === 'playing' || room.status === 'paused') {
-    checkForWinner(room);
   }
 
   if (room.status !== 'ended') {
@@ -297,6 +311,14 @@ io.on('connection', (socket) => {
     const room = getRoom(code);
 
     if (room.players.some((p) => p.id === socket.id)) return;
+    if (room.status !== 'lobby') {
+      socket.emit('joinError', 'Room already in progress. Wait for lobby reset.');
+      return;
+    }
+    if (room.players.length >= 8) {
+      socket.emit('joinError', 'Room is full (max 8 players).');
+      return;
+    }
 
     socket.join(code);
     socket.data.roomCode = code;
@@ -304,14 +326,14 @@ io.on('connection', (socket) => {
     room.players.push({
       id: socket.id,
       name: normalizedName,
-      penalties: 0,
-      eliminated: false
+      penaltyIndex: 0,
+      isActive: true
     });
 
     if (!room.hostId) room.hostId = socket.id;
     room.message = `${normalizedName} joined room ${code}.`;
 
-    startTicker(room);
+    ensureTicker(room);
     emitRoom(room);
   });
 
@@ -327,7 +349,7 @@ io.on('connection', (socket) => {
     const code = socket.data.roomCode;
     if (!code || !rooms.has(code)) return;
     const room = rooms.get(code);
-    handleLetter(room, socket.id, String(letter || '').slice(0, 1));
+    onLetter(room, socket.id, letter);
     emitRoom(room);
   });
 
@@ -344,18 +366,7 @@ io.on('connection', (socket) => {
     if (!code || !rooms.has(code)) return;
     const room = rooms.get(code);
     if (room.hostId !== socket.id) return;
-    room.status = 'lobby';
-    room.currentString = '';
-    room.turnDeadline = null;
-    room.pausedRemaining = null;
-    room.winnerId = null;
-    room.usedCountries = [];
-    room.lastPenalty = null;
-    room.message = 'Lobby reset. Host can start again.';
-    for (const p of room.players) {
-      p.penalties = 0;
-      p.eliminated = false;
-    }
+    moveToLobby(room);
     emitRoom(room);
   });
 
