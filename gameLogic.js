@@ -21,31 +21,21 @@ function countActivePlayers(state) {
   return state.players.filter((player) => player.isActive).length;
 }
 
-function findFirstActiveIndex(state) {
-  return state.players.findIndex((player) => player.isActive);
-}
-
-function advanceToNextActivePlayer(state, fromIndex = state.currentPlayerIndex) {
+function advanceToNextActivePlayer(state) {
   if (!state.players.length) return -1;
   if (!countActivePlayers(state)) return -1;
 
-  for (let step = 1; step <= state.players.length; step += 1) {
-    const idx = (fromIndex + step + state.players.length) % state.players.length;
-    if (state.players[idx] && state.players[idx].isActive) {
-      state.currentPlayerIndex = idx;
-      return idx;
-    }
-  }
+  do {
+    state.currentPlayerIndex = (state.currentPlayerIndex + 1 + state.players.length) % state.players.length;
+  } while (state.players[state.currentPlayerIndex] && state.players[state.currentPlayerIndex].isActive === false);
 
-  const fallback = findFirstActiveIndex(state);
-  state.currentPlayerIndex = fallback;
-  return fallback;
+  return state.currentPlayerIndex;
 }
 
-function resetRoundAndAdvance(state, fromIndex) {
+function endRoundAndAdvanceTurn(state) {
   state.currentPartial = '';
   state.turnDeadline = null;
-  advanceToNextActivePlayer(state, fromIndex);
+  advanceToNextActivePlayer(state);
 }
 
 function resolveWinner(state) {
@@ -97,7 +87,7 @@ function applyPenaltyAndEndRound(state, playerIndex, reason, now = Date.now()) {
     at: now
   };
 
-  resetRoundAndAdvance(state, playerIndex);
+  endRoundAndAdvanceTurn(state);
   const ended = resolveWinner(state);
 
   return {
@@ -133,7 +123,7 @@ function submitLetter(state, letterInput, now = Date.now()) {
   }
 
   state.currentPartial = candidate;
-  advanceToNextActivePlayer(state, state.currentPlayerIndex);
+  advanceToNextActivePlayer(state);
   state.turnDeadline = now + TURN_SECONDS * 1000;
 
   return {
